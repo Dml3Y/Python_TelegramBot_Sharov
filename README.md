@@ -1,2 +1,4 @@
-# Python_TelegramBot_Sharov
 Проект: Telegram-бот с функцией календаря
+Dmitrii Sharov
+Dml3Y
+dimas980910@gmail.com
