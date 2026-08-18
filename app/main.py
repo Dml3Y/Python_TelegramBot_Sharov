@@ -4,116 +4,142 @@ import os.path
 import datetime
 
 import telegram
-from telegram.ext import Updater, CommandHandler, MessageHandler, Filters
+from telegram.ext import Application, CommandHandler
+
+import psycopg2
+
+# Импортируем секреты из отдельного файла
+from secrets import API_TOKEN, DB_CONFIG
 
 
-updater = Updater(token="API_TOKEN")
+# Подключение к базе данных
+conn = psycopg2.connect(**DB_CONFIG)
+
+# Создаём таблицу events, если она ещё не существует
+with conn.cursor() as cur:
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS events (
+            id SERIAL PRIMARY KEY,
+            name TEXT NOT NULL,
+            date DATE NOT NULL,
+            time TIME NOT NULL,
+            details TEXT
+        );
+    """)
+    conn.commit()
 
 
 class Calendar:
-    def __init__(self):
-        self.events = {}          # {event_id: {id, name, date, time, details}}
-        self._next_id = 1         # для автоматической генерации ID
+    def __init__(self, db_connection):
+        self.conn = db_connection
 
     def create_event(self, event_name, event_date, event_time, event_details):
-        event_id = self._next_id
-        self._next_id += 1
-        event = {
-            "id": event_id,
-            "name": event_name,
-            "date": event_date,
-            "time": event_time,
-            "details": event_details
-        }
-        self.events[event_id] = event
-        return event_id
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "INSERT INTO events (name, date, time, details) VALUES (%s, %s, %s, %s) RETURNING id;",
+                (event_name, event_date, event_time, event_details)
+            )
+            event_id = cur.fetchone()[0]
+            self.conn.commit()
+            return event_id
 
     def read_event(self, event_name):
-        """
-        Возвращает словарь события по его имени.
-        Если найдено несколько событий с одинаковым именем – возвращает первое.
-        Если не найдено – возвращает None.
-        """
-        for ev in self.events.values():
-            if ev["name"] == event_name:
-                return ev
-        return None
+        with self.conn.cursor() as cur:
+            cur.execute(
+                "SELECT id, name, date, time, details FROM events WHERE name = %s;",
+                (event_name,)
+            )
+            row = cur.fetchone()
+            if row:
+                return {
+                    "id": row[0],
+                    "name": row[1],
+                    "date": row[2],
+                    "time": row[3],
+                    "details": row[4]
+                }
+            return None
 
     def edit_event(self, event_id, event_name=None, event_date=None,
                    event_time=None, event_details=None):
-        """
-        Обновляет поля события с заданным ID.
-        Если какое-то поле не передано – оно не меняется.
-        Возвращает True в случае успеха, False – если событие не найдено.
-        """
-        if event_id not in self.events:
-            return False
-        ev = self.events[event_id]
+        updates = []
+        params = []
         if event_name is not None:
-            ev["name"] = event_name
+            updates.append("name = %s")
+            params.append(event_name)
         if event_date is not None:
-            ev["date"] = event_date
+            updates.append("date = %s")
+            params.append(event_date)
         if event_time is not None:
-            ev["time"] = event_time
+            updates.append("time = %s")
+            params.append(event_time)
         if event_details is not None:
-            ev["details"] = event_details
-        return True
+            updates.append("details = %s")
+            params.append(event_details)
+
+        if not updates:
+            return True  # нечего менять
+
+        params.append(event_id)
+        query = f"UPDATE events SET {', '.join(updates)} WHERE id = %s;"
+        with self.conn.cursor() as cur:
+            cur.execute(query, params)
+            self.conn.commit()
+            return cur.rowcount > 0
 
     def delete_event(self, event_id):
-        """
-        Удаляет событие по ID.
-        Возвращает True, если удаление выполнено, иначе False.
-        """
-        if event_id in self.events:
-            del self.events[event_id]
-            return True
-        return False
+        with self.conn.cursor() as cur:
+            cur.execute("DELETE FROM events WHERE id = %s;", (event_id,))
+            self.conn.commit()
+            return cur.rowcount > 0
 
-    def display_event(self, event_name=None):
-        """
-        Если передано имя события – возвращает строку с его данными.
-        Если имя не указано – возвращает строку со всеми событиями.
-        """
-        if event_name is not None:
-            ev = self.read_event(event_name)
-            if ev is None:
-                return f"Событие с именем '{event_name}' не найдено."
-            return (f"ID: {ev['id']}\n"
-                    f"Название: {ev['name']}\n"
-                    f"Дата: {ev['date']}\n"
-                    f"Время: {ev['time']}\n"
-                    f"Подробности: {ev['details']}")
-        else:
-            if not self.events:
+    def display_events(self):
+        with self.conn.cursor() as cur:
+            cur.execute("SELECT id, name, date, time, details FROM events ORDER BY date, time;")
+            rows = cur.fetchall()
+            if not rows:
                 return "Список событий пуст."
             lines = ["Список событий:"]
-            for ev in self.events.values():
+            for row in rows:
                 lines.append(
-                    f"ID: {ev['id']}, {ev['name']}, {ev['date']} {ev['time']} - {ev['details']}"
+                    f"ID: {row[0]}, {row[1]}, {row[2]} {row[3]} - {row[4] if row[4] else ''}"
                 )
             return "\n".join(lines)
 
-    # Можно также переопределить display_events как синоним display_event без аргументов
-    def display_events(self):
-        return self.display_event()   # возвращает строку со всеми событиями
+    def display_event(self, event_name=None):
+        if event_name is None:
+            return self.display_events()
+        event = self.read_event(event_name)
+        if event is None:
+            return f"Событие с именем '{event_name}' не найдено."
+        return (f"ID: {event['id']}\n"
+                f"Название: {event['name']}\n"
+                f"Дата: {event['date']}\n"
+                f"Время: {event['time']}\n"
+                f"Подробности: {event['details']}")
 
-# Зададим глобально доступный объект календаря
-calendar = Calendar()
 
-# Обновлённый обработчик создания события (принимает все параметры через |)
-def create_event_handler(update, context):
+# Создаём экземпляр календаря с подключением к БД
+calendar = Calendar(conn)
+
+# Создаём экземпляр Updater с токеном из secrets.py
+application = Application.builder().token(API_TOKEN).build()
+
+
+# ---------- Обработчики команд (остаются без изменений) ----------
+async def create_event_handler(update, context):
     try:
         text = update.message.text
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=update.message.chat_id,
                 text="Укажите данные в формате: /create_event Название|Дата|Время|Описание"
             )
             return
         args = parts[1].split('|')
         if len(args) < 4:
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=update.message.chat_id,
                 text="Недостаточно данных. Формат: Название|Дата|Время|Описание"
             )
@@ -123,23 +149,23 @@ def create_event_handler(update, context):
         event_time = args[2].strip()
         event_details = args[3].strip()
         event_id = calendar.create_event(event_name, event_date, event_time, event_details)
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=update.message.chat_id,
             text=f"Событие '{event_name}' создано с ID {event_id}."
         )
     except Exception:
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=update.message.chat_id,
             text="При создании события произошла ошибка."
         )
 
-# Чтение события по имени
-def read_event_handler(update, context):
+
+async def read_event_handler(update, context):
     try:
         text = update.message.text
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=update.message.chat_id,
                 text="Укажите название события. Пример: /read_event Встреча"
             )
@@ -150,32 +176,32 @@ def read_event_handler(update, context):
             msg = (f"ID: {event['id']}\nНазвание: {event['name']}\n"
                    f"Дата: {event['date']}\nВремя: {event['time']}\n"
                    f"Детали: {event['details']}")
-            context.bot.send_message(chat_id=update.message.chat_id, text=msg)
+            await context.bot.send_message(chat_id=update.message.chat_id, text=msg)
         else:
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=update.message.chat_id,
                 text=f"Событие с названием '{event_name}' не найдено."
             )
     except Exception:
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=update.message.chat_id,
             text="Произошла ошибка при чтении события."
         )
 
-# Редактирование события по ID (поля через |, пустые поля – не меняются)
-def edit_event_handler(update, context):
+
+async def edit_event_handler(update, context):
     try:
         text = update.message.text
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=update.message.chat_id,
                 text="Укажите ID и новые данные через |. Пример: /edit_event 1|Новое название|2023-03-15|15:30|Новое описание"
             )
             return
         args = parts[1].split('|')
         if len(args) < 5:
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=update.message.chat_id,
                 text="Недостаточно данных. Формат: ID|Название|Дата|Время|Детали (можно пропускать, но сохранять порядок)"
             )
@@ -183,7 +209,7 @@ def edit_event_handler(update, context):
         try:
             event_id = int(args[0].strip())
         except ValueError:
-            context.bot.send_message(chat_id=update.message.chat_id, text="ID должно быть числом.")
+            await context.bot.send_message(chat_id=update.message.chat_id, text="ID должно быть числом.")
             return
         new_name = args[1].strip() if args[1].strip() else None
         new_date = args[2].strip() if args[2].strip() else None
@@ -191,28 +217,28 @@ def edit_event_handler(update, context):
         new_details = args[4].strip() if args[4].strip() else None
         success = calendar.edit_event(event_id, new_name, new_date, new_time, new_details)
         if success:
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=update.message.chat_id,
                 text=f"Событие с ID {event_id} обновлено."
             )
         else:
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=update.message.chat_id,
                 text=f"Событие с ID {event_id} не найдено."
             )
     except Exception:
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=update.message.chat_id,
             text="Произошла ошибка при редактировании."
         )
 
-# Удаление события по ID
-def delete_event_handler(update, context):
+
+async def delete_event_handler(update, context):
     try:
         text = update.message.text
         parts = text.split(maxsplit=1)
         if len(parts) < 2:
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=update.message.chat_id,
                 text="Укажите ID события. Пример: /delete_event 1"
             )
@@ -220,47 +246,47 @@ def delete_event_handler(update, context):
         try:
             event_id = int(parts[1].strip())
         except ValueError:
-            context.bot.send_message(chat_id=update.message.chat_id, text="ID должно быть числом.")
+            await context.bot.send_message(chat_id=update.message.chat_id, text="ID должно быть числом.")
             return
         success = calendar.delete_event(event_id)
         if success:
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=update.message.chat_id,
                 text=f"Событие с ID {event_id} удалено."
             )
         else:
-            context.bot.send_message(
+            await context.bot.send_message(
                 chat_id=update.message.chat_id,
                 text=f"Событие с ID {event_id} не найдено."
             )
     except Exception:
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=update.message.chat_id,
             text="Произошла ошибка при удалении."
         )
 
-# Отображение всех событий
-def display_events_handler(update, context):
+
+async def display_events_handler(update, context):
     try:
         events_str = calendar.display_events()
-        context.bot.send_message(chat_id=update.message.chat_id, text=events_str)
+        await context.bot.send_message(chat_id=update.message.chat_id, text=events_str)
     except Exception:
-        context.bot.send_message(
+        await context.bot.send_message(
             chat_id=update.message.chat_id,
             text="Произошла ошибка при выводе событий."
         )
 
-updater.dispatcher.add_handler(CommandHandler('create_event', create_event_handler))
-updater.dispatcher.add_handler(CommandHandler('read_event', read_event_handler))
-updater.dispatcher.add_handler(CommandHandler('edit_event', edit_event_handler))
-updater.dispatcher.add_handler(CommandHandler('delete_event', delete_event_handler))
-updater.dispatcher.add_handler(CommandHandler('display_events', display_events_handler))
+
+application.add_handler(CommandHandler('create_event', create_event_handler))
+application.add_handler(CommandHandler('read_event', read_event_handler))
+application.add_handler(CommandHandler('edit_event', edit_event_handler))
+application.add_handler(CommandHandler('delete_event', delete_event_handler))
+application.add_handler(CommandHandler('display_events', display_events_handler))
 
 
 def main():
-    # Запуск бота (обработчики уже зарегистрированы, объект calendar существует глобально)
-    updater.start_polling()
-    updater.idle()  # ожидание остановки бота
+    application.run_polling()
+
 
 if __name__ == "__main__":
     main()
