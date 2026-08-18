@@ -88,10 +88,14 @@ class Calendar:
             return cur.rowcount > 0
 
     def delete_event(self, event_id):
-        with self.conn.cursor() as cur:
-            cur.execute("DELETE FROM events WHERE id = %s;", (event_id,))
-            self.conn.commit()
-            return cur.rowcount > 0
+        try:
+            with self.conn.cursor() as cur:
+                cur.execute("DELETE FROM events WHERE id = %s;", (event_id,))
+                self.conn.commit()
+                return cur.rowcount > 0
+        except Exception:
+            # Если возникла ошибка (например, соединение с БД), считаем, что удаление не выполнено
+            return False
 
     def display_events(self):
         with self.conn.cursor() as cur:
@@ -259,10 +263,10 @@ async def delete_event_handler(update, context):
                 chat_id=update.message.chat_id,
                 text=f"Событие с ID {event_id} не найдено."
             )
-    except Exception:
+    except Exception as e:
         await context.bot.send_message(
             chat_id=update.message.chat_id,
-            text="Произошла ошибка при удалении."
+            text=f"Произошла ошибка при удалении: {e}"
         )
 
 
